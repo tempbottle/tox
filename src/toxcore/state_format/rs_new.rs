@@ -21,6 +21,7 @@
 //! better will become available.*
 
 use std::default::Default;
+#[cfg(test)]
 use byteorder::{BigEndian, LittleEndian, WriteBytesExt};
 #[cfg(test)]
 use byteorder::ByteOrder;
@@ -28,9 +29,8 @@ use nom::{be_u16, le_u16, le_u8, le_u32, le_u64, rest};
 
 use toxcore::binary_io::*;
 use toxcore::crypto_core::*;
-use toxcore::dht::*;
+use toxcore::dht::packed_node::*;
 use toxcore::toxid::{NoSpam, NOSPAMBYTES};
-
 
 #[cfg(test)]
 use quickcheck::*;
@@ -41,6 +41,13 @@ use quickcheck::*;
 // FIXME: move somewhere else
 // TODO: rename
 const REQUEST_MSG_LEN: usize = 1024;
+
+/// Size in bytes of serialized [`PackedNode`](./struct.PackedNode.html) with
+/// IPv4.
+pub const PACKED_NODE_IPV4_SIZE: usize = PUBLICKEYBYTES + 7;
+/// Size in bytes of serialized [`PackedNode`](./struct.PackedNode.html) with
+/// IPv6.
+pub const PACKED_NODE_IPV6_SIZE: usize = PUBLICKEYBYTES + 19;
 
 
 // TODO: improve docs
@@ -96,21 +103,20 @@ pub enum SectionKind {
     https://zetok.github.io/tox-spec/#path-nodes-0x0b
     */
     PathNodes =  0x0b,
-    /// End of file. https://zetok.github.io/tox-spec/#eof-0xff
-    EOF =        0xff,
 }
 
-from_bytes!(SectionKind, switch!(le_u16,
-    0x01 => value!(SectionKind::NospamKeys) |
-    0x02 => value!(SectionKind::DHT) |
-    0x03 => value!(SectionKind::Friends) |
-    0x04 => value!(SectionKind::Name) |
-    0x05 => value!(SectionKind::StatusMsg) |
-    0x06 => value!(SectionKind::Status) |
-    0x0a => value!(SectionKind::TcpRelays) |
-    0x0b => value!(SectionKind::PathNodes) |
-    0xff => value!(SectionKind::EOF)
-));
+impl FromBytes for SectionKind {
+    named!(from_bytes<SectionKind>, switch ! (le_u16,
+        0x01 => value ! (SectionKind::NospamKeys) |
+        0x02 => value ! (SectionKind::DHT) |
+        0x03 => value ! (SectionKind::Friends) |
+        0x04 => value ! (SectionKind::Name) |
+        0x05 => value ! (SectionKind::StatusMsg) |
+        0x06 => value ! (SectionKind::Status) |
+        0x0a => value ! (SectionKind::TcpRelays) |
+        0x0b => value ! (SectionKind::PathNodes)
+    ));
+}
 
 /** Serialization into bytes
 
@@ -126,15 +132,13 @@ assert_eq!(vec![5u8, 0],   SectionKind::StatusMsg  .to_bytes());
 assert_eq!(vec![6u8, 0],   SectionKind::Status     .to_bytes());
 assert_eq!(vec![10u8, 0],  SectionKind::TcpRelays  .to_bytes());
 assert_eq!(vec![11u8, 0],  SectionKind::PathNodes  .to_bytes());
-assert_eq!(vec![255u8, 0], SectionKind::EOF        .to_bytes());
 ```
 */
 impl ToBytes for SectionKind {
-    fn to_bytes(&self) -> Vec<u8> {
-        let mut result = Vec::with_capacity(2);
-        result.write_u16::<LittleEndian>(*self as u16)
-            .expect("Failed to write SectionKind!");
-        result
+    fn to_bytes<'a>(&self, buf: (&'a mut [u8], usize)) -> Result<(&'a mut [u8], usize), GenError> {
+        do_gen!(buf,
+            gen_le_u16!(0x00 << 8 | *self as u8)
+        )
     }
 }
 
@@ -165,8 +169,7 @@ section_kind_for_section!(
     StatusMsg, StatusMsg, status_msg_kind_test,
     Status, UserStatus, user_status_kind_test,
     TcpRelays, TcpRelays, tcp_relays_kind_test,
-    PathNodes, PathNodes, path_nodes_kind_test,
-    EOF, Eof, eof_kind_test
+    PathNodes, PathNodes, path_nodes_kind_test
 );
 
 
@@ -230,16 +233,18 @@ assert_eq!(result, NospamKeys::from_bytes(&bytes)
                     .expect("Failed to parse NospamKeys!"));
 ```
 */
-from_bytes!(NospamKeys, do_parse!(
-    nospam: call!(NoSpam::parse_bytes) >>
-    pk: call!(PublicKey::parse_bytes) >>
-    sk: call!(SecretKey::parse_bytes) >>
-    (NospamKeys {
-        nospam: nospam,
-        pk: pk,
-        sk: sk
-    })
-));
+impl FromBytes for NospamKeys {
+    named!(from_bytes<NospamKeys>, do_parse!(
+        nospam: call!(NoSpam::from_bytes) >>
+        pk: call!(PublicKey::from_bytes) >>
+        sk: call!(SecretKey::from_bytes) >>
+        (NospamKeys {
+            nospam: nospam,
+            pk: pk,
+            sk: sk
+        })
+    ));
+}
 
 /** E.g.
 
@@ -295,12 +300,12 @@ use self::tox::toxcore::toxid::{NoSpam, NOSPAMBYTES};
 ```
 */
 impl ToBytes for NospamKeys {
-    fn to_bytes(&self) -> Vec<u8> {
-        let mut result = Vec::with_capacity(NOSPAMKEYSBYTES);
-        result.extend_from_slice(&self.nospam.0);
-        result.extend_from_slice(&self.pk.0);
-        result.extend_from_slice(&self.sk.0);
-        result
+    fn to_bytes<'a>(&self, buf: (&'a mut [u8], usize)) -> Result<(&'a mut [u8], usize), GenError> {
+        do_gen!(buf,
+            gen_slice!(self.nospam.0) >>
+            gen_slice!(self.pk.as_ref()) >>
+            gen_slice!(self.sk.0)
+        )
     }
 }
 
@@ -365,7 +370,7 @@ use self::tox::toxcore::state_format::old::*;
 
 let serialized = vec![
         0x0d, 0x00, 0x59, 0x01,  // the first magic number
-        0, 0, 0, 0,   // length of `PackedNode`s bytes
+        0, 0, 0, 0,   // number of `PackedNode`
         0x04, 0,  // section magic number
         0xce, 0x11,  // another magic number
         // here would go `PackedNode`s, but since their length is `0`..
@@ -374,14 +379,16 @@ let serialized = vec![
 assert_eq!(DhtState(vec![]), DhtState::from_bytes(&serialized).unwrap());
 ```
 */
-from_bytes!(DhtState, do_parse!(
-    verify!(le_u32, |value| value == DHT_MAGICAL) >> // check whether beginning of the section matches DHT magic bytes
-    nodes: le_u32 >>
-    verify!(le_u16, |value| value == DHT_SECTION_TYPE) >> // check DHT section type
-    verify!(le_u16, |value| value == DHT_2ND_MAGICAL) >> // check whether yet another magic number matches
-    pns: flat_map!(take!(nodes as usize), many0!(PackedNode::parse_bytes)) >>
-    (DhtState(pns))
-));
+impl FromBytes for DhtState {
+    named!(from_bytes<DhtState>, do_parse!(
+        verify!(le_u32, |value| value == DHT_MAGICAL) >> // check whether beginning of the section matches DHT magic bytes
+        nodes: le_u32 >>
+        verify!(le_u16, |value| value == DHT_SECTION_TYPE) >> // check DHT section type
+        verify!(le_u16, |value| value == DHT_2ND_MAGICAL) >> // check whether yet another magic number matches
+        pns: flat_map!(take!(nodes as usize), many0!(PackedNode::from_bytes)) >>
+        (DhtState(pns))
+    ));
+}
 
 /** E.g. serialization of an empty list:
 
@@ -392,7 +399,7 @@ use self::tox::toxcore::state_format::old::*;
 
 let result = vec![
         0x0d, 0x00, 0x59, 0x01,  // the first magic number
-        0, 0, 0, 0,   // length of `PackedNode`s bytes
+        0, 0, 0, 0,   // number of `PackedNode`
         0x04, 0,  // section magic number
         0xce, 0x11,  // another magic number
         // here would go `PackedNode`s, but since their length is `0`..
@@ -402,35 +409,14 @@ assert_eq!(result, DhtState(vec![]).to_bytes());
 ```
 */
 impl ToBytes for DhtState {
-    fn to_bytes(&self) -> Vec<u8> {
-        let mut result = Vec::with_capacity(DHT_STATE_MIN_SIZE);
-        result.write_u32::<LittleEndian>(DHT_MAGICAL)
-            .expect("Failed to write DhtState DHT_MAGICAL!");;
-
-        let pn_bytes = {
-            let mut bytes = Vec::with_capacity(
-                                    PACKED_NODE_IPV6_SIZE * self.0.len());
-            for pn in &self.0 {
-                bytes.extend_from_slice(&pn.to_bytes());
-            }
-            bytes
-        };
-
-        // add length of serialized `PackedNode`s
-        result.write_u32::<LittleEndian>(pn_bytes.len() as u32)
-            .expect("Failed to write DhtState PackedNode length!");
-
-        // section magic number
-        result.write_u16::<LittleEndian>(DHT_SECTION_TYPE)
-            .expect("Failed to write DhtState DHT_SECTION_TYPE!");
-
-        // 2nd magic number
-        result.write_u16::<LittleEndian>(DHT_2ND_MAGICAL)
-            .expect("Failed to write DhtState DHT_2ND_MAGICAL!");
-
-        // and `PackedNode`s
-        result.extend_from_slice(&pn_bytes);
-        result
+    fn to_bytes<'a>(&self, buf: (&'a mut [u8], usize)) -> Result<(&'a mut [u8], usize), GenError> {
+        do_gen!(buf,
+            gen_le_u32!(DHT_MAGICAL as u32) >>
+            gen_le_u32!(self.0.len() as u32) >>
+            gen_le_u16!(DHT_SECTION_TYPE as u16) >>
+            gen_le_u16!(DHT_2ND_MAGICAL as u16) >>
+            gen_many_ref!(&self.0, |buf, node| PackedNode::to_bytes(node, buf))
+        )
     }
 }
 
@@ -507,7 +493,7 @@ use self::tox::toxcore::state_format::old::*;
 
 { // empty
     assert_eq!(None, FriendStatus::from_bytes(&[]));
-    let debug = format!("{:?}", FriendStatus::parse_bytes(&[]).unwrap_err());
+    let debug = format!("{:?}", FriendStatus::from_bytes(&[]).unwrap_err());
     let err_msg = "Not enough bytes for FriendStatus.";
     assert!(debug.contains(err_msg));
 }
@@ -516,20 +502,21 @@ use self::tox::toxcore::state_format::old::*;
 for i in 5..256 {
     let bytes = [i as u8];
     assert_eq!(None, FriendStatus::from_bytes(&bytes));
-    let debug = format!("{:?}", FriendStatus::parse_bytes(&bytes).unwrap_err());
+    let debug = format!("{:?}", FriendStatus::from_bytes(&bytes).unwrap_err());
     let err_msg = format!("Unknown FriendStatus: {}", i);
     assert!(debug.contains(&err_msg));
 }
 ```
 */
-from_bytes!(FriendStatus, switch!(le_u8,
-    0 => value!(FriendStatus::NotFriend) |
-    1 => value!(FriendStatus::Added) |
-    2 => value!(FriendStatus::FrSent) |
-    3 => value!(FriendStatus::Confirmed) |
-    4 => value!(FriendStatus::Online)
-));
-
+impl FromBytes for FriendStatus {
+    named!(from_bytes<FriendStatus>, switch!(le_u8,
+        0 => value!(FriendStatus::NotFriend) |
+        1 => value!(FriendStatus::Added) |
+        2 => value!(FriendStatus::FrSent) |
+        3 => value!(FriendStatus::Confirmed) |
+        4 => value!(FriendStatus::Online)
+    ));
+}
 
 /** User status. Used for both own & friend statuses.
 
@@ -559,15 +546,19 @@ impl Default for UserStatus {
     }
 }
 
-from_bytes!(UserStatus, switch!(le_u8,
-    0 => value!(UserStatus::Online) |
-    1 => value!(UserStatus::Away) |
-    2 => value!(UserStatus::Busy)
-));
+impl FromBytes for UserStatus {
+    named!(from_bytes<UserStatus>, switch!(le_u8,
+        0 => value!(UserStatus::Online) |
+        1 => value!(UserStatus::Away) |
+        2 => value!(UserStatus::Busy)
+    ));
+}
 
 impl ToBytes for UserStatus {
-    fn to_bytes(&self) -> Vec<u8> {
-        vec![*self as u8]
+    fn to_bytes<'a>(&self, buf: (&'a mut [u8], usize)) -> Result<(&'a mut [u8], usize), GenError> {
+        do_gen!(buf,
+            gen_le_u8!(*self as u8)
+        )
     }
 }
 
@@ -621,103 +612,155 @@ impl FriendState {
 /// Number of bytes of serialized [`FriendState`](./struct.FriendState.html).
 pub const FRIENDSTATEBYTES: usize = 1      // "Status"
                                   + PUBLICKEYBYTES
-/* Friend request message      */ + REQUEST_MSG_LEN
-/* padding1                    */ + 1
 /* actual size of FR message   */ + 2
-/* Name;                       */ + NAME_LEN
+/* Friend request message      */ + REQUEST_MSG_LEN
 /* actual size of Name         */ + 2
-/* Status msg;                 */ + STATUS_MSG_LEN
-/* padding2                    */ + 1
+/* Name                        */ + NAME_LEN
 /* actual size of status msg   */ + 2
+/* Status msg                  */ + STATUS_MSG_LEN
 /* UserStatus                  */ + 1
-/* padding3                    */ + 3
 /* only used for sending FR    */ + NOSPAMBYTES
 /* last time seen              */ + 8;
 
-from_bytes!(FriendState, do_parse!(
-    status: call!(FriendStatus::parse_bytes) >>
-    pk: call!(PublicKey::parse_bytes) >>
-    fr_msg_bytes: take!(REQUEST_MSG_LEN) >>
-    take!(1) >> // padding
-    fr_msg_len: verify!(map!(be_u16, |len| len as usize), |len| len <= REQUEST_MSG_LEN) >>
-    fr_msg: value!(fr_msg_bytes[..fr_msg_len].to_vec()) >>
-    name_bytes: take!(NAME_LEN) >>
-    name_len: verify!(map!(be_u16, |len| len as usize), |len| len <= NAME_LEN) >>
-    name: value!(Name(name_bytes[..name_len].to_vec())) >>
-    status_msg_bytes: take!(STATUS_MSG_LEN) >>
-    take!(1) >> // padding
-    status_msg_len: verify!(map!(be_u16, |len| len as usize), |len| len <= STATUS_MSG_LEN) >>
-    status_msg: value!(StatusMsg(status_msg_bytes[..status_msg_len].to_vec())) >>
-    user_status: call!(UserStatus::parse_bytes) >>
-    take!(3) >> // padding
-    nospam: call!(NoSpam::parse_bytes) >>
-    seen: le_u64 >>
-    (FriendState {
-        status: status,
-        pk: pk,
-        fr_msg: fr_msg,
-        name: name,
-        status_msg: status_msg,
-        user_status: user_status,
-        nospam: nospam,
-        last_seen: seen,
-    })
-));
+impl FromBytes for FriendState {
+    named!(from_bytes<FriendState>, do_parse!(
+        status: call!(FriendStatus::from_bytes) >>
+        pk: call!(PublicKey::from_bytes) >>
+        fr_msg_len: be_u16 >>
+//        verify!(fr_msg_len, |len| len <= REQUEST_MSG_LEN) >>
+        fr_msg_bytes: take!(fr_msg_len) >>
+        fr_msg: value!(fr_msg_bytes[..fr_msg_len as usize].to_vec()) >>
+        name_len: be_u16 >>
+//        verify!(name_len, |len| len <= NAME_LEN) >>
+        name_bytes: take!(name_len) >>
+        name: value!(Name(name_bytes[..name_len as usize].to_vec())) >>
+        status_msg_len: be_u16 >>
+//        verify!(status_msg_len, |len| len <= STATUS_MSG_LEN) >>
+        status_msg_bytes: take!(status_msg_len) >>
+        status_msg: value!(StatusMsg(status_msg_bytes[..status_msg_len as usize].to_vec())) >>
+        user_status: call!(UserStatus::from_bytes) >>
+        nospam: call!(NoSpam::from_bytes) >>
+        last_seen: le_u64 >>
+        (FriendState {
+            status,
+            pk,
+            fr_msg,
+            name,
+            status_msg,
+            user_status,
+            nospam,
+            last_seen,
+        })
+    ));
+}
+
 // TODO: write tests ↑
-
 impl ToBytes for FriendState {
-    fn to_bytes(&self) -> Vec<u8> {
-        // extend vec with all contents of slice and pad with `0`s up to `len`
-        // assume that Vec isn't too big for fr_msg
-        fn ext_vec(vec: &mut Vec<u8>, slice: &[u8], len: usize) {
-            let mut to_add = slice.to_vec();
-            append_zeros(&mut to_add, len);
-            vec.append(&mut to_add);
+    fn to_bytes<'a>(&self, buf: (&'a mut [u8], usize)) -> Result<(&'a mut [u8], usize), GenError> {
+        do_gen!(buf,
+            gen_le_u8!(self.status as u8) >>
+            gen_slice!(self.pk.as_ref()) >>
+            gen_be_u16!(self.fr_msg.len()) >>
+            gen_slice!(self.fr_msg.as_slice()) >>
+            gen_be_u16!(self.name.0.len()) >>
+            gen_slice!(self.name.0.as_slice()) >>
+            gen_be_u16!(self.status_msg.0.len()) >>
+            gen_slice!(self.status_msg.0.as_slice()) >>
+            gen_le_u8!(self.user_status as u8) >>
+            gen_slice!(self.nospam.0) >>
+            gen_le_u64!(self.last_seen)
+        )
+    }
+}
+
+#[cfg(test)]
+impl Arbitrary for FriendStatus {
+    fn arbitrary<G: Gen>(g: &mut G) -> Self {
+        match g.gen_range(0, 5) {
+            0 => FriendStatus::NotFriend,
+            1 => FriendStatus::Added,
+            2 => FriendStatus::FrSent,
+            3 => FriendStatus::Confirmed,
+            4 => FriendStatus::Online,
+            err => {
+                debug!("System error: gen_range(0, 5): {:?}", err);
+                FriendStatus::NotFriend
+            }
         }
+    }
+}
 
-        let mut result = Vec::with_capacity(FRIENDSTATEBYTES);
+#[cfg(test)]
+impl Arbitrary for UserStatus {
+    fn arbitrary<G: Gen>(g: &mut G) -> Self {
+        match g.gen_range(0, 3) {
+            0 => UserStatus::Online,
+            1 => UserStatus::Away,
+            2 => UserStatus::Busy,
+            err => {
+                debug!("System error: gen_range(0, 3): {:?}", err);
+                UserStatus::Online
+            }
+        }
+    }
+}
 
-        // friend status
-        result.push(self.status as u8);
+#[cfg(test)]
+impl Arbitrary for Name {
+    fn arbitrary<G: Gen>(g: &mut G) -> Self {
+        let name_len = g.gen_range(0, NAME_LEN);
+        let mut name_buf = [0u8; NAME_LEN];
+        g.fill_bytes(&mut name_buf[..name_len]);
+        Name(name_buf[..name_len].to_vec())
+    }
+}
 
-        // pk
-        result.extend_from_slice(&self.pk.0);
+#[cfg(test)]
+impl Arbitrary for StatusMsg {
+    fn arbitrary<G: Gen>(g: &mut G) -> Self {
+        let msg_len = g.gen_range(0, STATUS_MSG_LEN);
+        let mut msg_buf = [0u8; STATUS_MSG_LEN];
+        g.fill_bytes(&mut msg_buf[..msg_len]);
+        StatusMsg(msg_buf[..msg_len].to_vec())
+    }
+}
 
-        // friend request msg..
-        ext_vec(&mut result, &self.fr_msg, REQUEST_MSG_LEN);
-        // padding
-        result.push(0);
-        // .. and its length
-        result.write_u16::<BigEndian>(self.fr_msg.len() as u16)
-            .expect("Failed to write FriendState message length!");
+#[cfg(test)]
+impl Arbitrary for DhtState {
+    fn arbitrary<G: Gen>(g: &mut G) -> Self {
+        let node_num = g.gen_range(0, 65);
+        let nodes = (0..node_num).into_iter()
+            .map(|_| PackedNode::arbitrary(g))
+            .collect::<Vec<PackedNode>>();
+        DhtState(nodes)
+    }
+}
 
-        // name and its length
-        ext_vec(&mut result, &self.name.0, NAME_LEN);
-        result.write_u16::<BigEndian>(self.name.0.len() as u16)
-            .expect("Failed to write FriendState name length!");
+#[cfg(test)]
+impl Arbitrary for NoSpam {
+    fn arbitrary<G: Gen>(g: &mut G) -> Self {
+        let mut no_spam_buf = [0u8; NOSPAMBYTES];
+        g.fill_bytes(&mut no_spam_buf);
+        NoSpam(no_spam_buf)
+    }
+}
 
-        // status msg ..
-        ext_vec(&mut result, &self.status_msg.0, STATUS_MSG_LEN);
-        // padding
-        result.push(0);
-        // .. and its length
-        result.write_u16::<BigEndian>(self.status_msg.0.len() as u16)
-            .expect("Failed to write FriendState padding length!");
+#[cfg(test)]
+impl Arbitrary for NospamKeys {
+    fn arbitrary<G: Gen>(g: &mut G) -> Self {
+        let mut pk_bytes = [0; PUBLICKEYBYTES];
+        g.fill_bytes(&mut pk_bytes);
+        let pk = PublicKey(pk_bytes);
 
-        // UserStatus
-        result.push(self.user_status as u8);
+        let mut sk_bytes = [0; SECRETKEYBYTES];
+        g.fill_bytes(&mut sk_bytes);
+        let sk = SecretKey(sk_bytes);
 
-        // padding
-        append_zeros(&mut result, FRIENDSTATEBYTES - 12);
-
-        // NoSpam
-        result.extend_from_slice(&self.nospam.0);
-
-        // last seen
-        result.write_u64::<LittleEndian>(self.last_seen)
-            .expect("Failed to write FriendState last seen!");
-
-        result
+        NospamKeys {
+            nospam: NoSpam::arbitrary(g),
+            pk,
+            sk,
+        }
     }
 }
 
@@ -793,15 +836,31 @@ impl Friends {
     }
 }
 
-from_bytes!(Friends, map!(many0!(FriendState::parse_bytes), Friends));
+impl FromBytes for Friends {
+    named!(from_bytes<Friends>, map!(many0!(FriendState::from_bytes), Friends));
+}
 
 impl ToBytes for Friends {
-    fn to_bytes(&self) -> Vec<u8> {
-        let mut res = Vec::with_capacity(FRIENDSTATEBYTES * self.0.len());
-        for f in &self.0 {
-            res.extend_from_slice(&f.to_bytes());
-        }
-        res
+    fn to_bytes<'a>(&self, buf: (&'a mut [u8], usize)) -> Result<(&'a mut [u8], usize), GenError> {
+        do_gen!(buf,
+            gen_many_ref!(&self.0, |buf, friend| FriendState::to_bytes(friend, buf))
+        )
+    }
+}
+
+impl ToBytes for Name {
+    fn to_bytes<'a>(&self, buf: (&'a mut [u8], usize)) -> Result<(&'a mut [u8], usize), GenError> {
+        do_gen!(buf,
+            gen_slice!(self.0.as_slice())
+        )
+    }
+}
+
+impl ToBytes for StatusMsg {
+    fn to_bytes<'a>(&self, buf: (&'a mut [u8], usize)) -> Result<(&'a mut [u8], usize), GenError> {
+        do_gen!(buf,
+            gen_slice!(self.0.as_slice())
+        )
     }
 }
 
@@ -815,16 +874,11 @@ impl Arbitrary for Friends {
 
 macro_rules! impl_to_bytes_for_bytes_struct {
     ($name:ty, $tname:ident) => (
-        impl ToBytes for $name {
-            fn to_bytes(&self) -> Vec<u8> {
-                self.0.clone()
-            }
-        }
-
         #[test]
         fn $tname() {
             fn test_fn(s: $name) {
-                assert_eq!(s.0, s.to_bytes());
+                let mut buf = [0; 512];
+                assert_eq!(s.0, s.to_bytes((&mut buf, 0)).unwrap().0);
             }
             quickcheck(test_fn as fn($name));
         }
@@ -876,7 +930,9 @@ impl Name {
 /** Produces up to [`NAME_LEN`](./constant.NAME_LEN.html) bytes long `Name`.
     Can't fail.
 */
-from_bytes!(Name, map!(alt_complete!(take!(NAME_LEN) | rest), Name::new));
+impl FromBytes for Name {
+    named!(from_bytes<Name>, map!(alt_complete!(take!(NAME_LEN) | rest), Name::new));
+}
 
 impl_to_bytes_for_bytes_struct!(Name, name_to_bytes_test);
 
@@ -925,10 +981,38 @@ impl StatusMsg {
     }
 }
 
+#[cfg(test)]
+macro_rules! impl_arb_for_pn {
+    ($name:ident) => (
+        impl Arbitrary for $name {
+            fn arbitrary<G: Gen>(g: &mut G) -> Self {
+                $name(Arbitrary::arbitrary(g))
+            }
+        }
+    )
+}
+
+/** PublicKey from bytes. Returns `TestResult::discard()` if there are not
+enough bytes.
+*/
+#[cfg(test)]
+macro_rules! quick_pk_from_bytes {
+    ($input:ident, $out:ident) => (
+        if $input.len() < PUBLICKEYBYTES {
+            return TestResult::discard()
+        }
+
+        let $out = PublicKey::from_slice(&$input[..PUBLICKEYBYTES])
+            .expect("Failed to make PK from slice");
+    )
+}
+
 /** Produces up to [`STATUS_MSG_LEN`](./constant.STATUS_MSG_LEN.html) bytes
 long `StatusMsg`. Can't fail.
 */
-from_bytes!(StatusMsg, map!(alt_complete!(take!(STATUS_MSG_LEN) | rest), StatusMsg::new));
+impl FromBytes for StatusMsg {
+    named!(from_bytes<StatusMsg>, map!(alt_complete!(take!(STATUS_MSG_LEN) | rest), StatusMsg::new));
+}
 
 impl_to_bytes_for_bytes_struct!(StatusMsg, status_msg_to_bytes_test);
 
@@ -938,16 +1022,15 @@ macro_rules! nodes_list {
         #[derive(Clone, Debug, Default, Eq, PartialEq)]
         pub struct $name(pub Vec<PackedNode>);
 
-        from_bytes!($name, map!(many0!(PackedNode::parse_bytes), $name));
+        impl FromBytes for $name {
+            named!(from_bytes<$name>, map!(many0!(PackedNode::from_bytes), $name));
+        }
 
         impl ToBytes for $name {
-            fn to_bytes(&self) -> Vec<u8> {
-                let mut result = Vec::with_capacity(
-                            PACKED_NODE_IPV6_SIZE * self.0.len());
-                for node in &self.0 {
-                    result.append(&mut node.to_bytes());
-                }
-                result
+            fn to_bytes<'a>(&self, buf: (&'a mut [u8], usize)) -> Result<(&'a mut [u8], usize), GenError> {
+                do_gen!(buf,
+                    gen_many_ref!(&self.0, |buf, node| PackedNode::to_bytes(node, buf))
+                )
             }
         }
 
@@ -960,17 +1043,18 @@ macro_rules! nodes_list {
         fn $tname() {
             fn with_pns(pns: Vec<PackedNode>) {
                 let mut bytes = Vec::new();
+                let mut buf = [0u8; 1024];
                 for pn in &pns {
-                    bytes.append(&mut pn.to_bytes());
+                    bytes.append(&mut pn.to_bytes((&mut buf, 0)).unwrap().0.to_vec());
                 }
                 {
-                    let (r_bytes, p) = $name::parse_bytes(&bytes).unwrap();
+                    let (r_bytes, p) = $name::from_bytes(&bytes).unwrap();
 
                     assert_eq!(p.0, pns);
                     assert_eq!(&[] as &[u8], r_bytes);
                 }
 
-                assert_eq!($name(pns).to_bytes(), bytes);
+                assert_eq!($name(pns).to_bytes((&mut buf, 0)).unwrap().0.to_vec(), bytes);
             }
             quickcheck(with_pns as fn(Vec<PackedNode>));
 
@@ -984,21 +1068,6 @@ nodes_list!(TcpRelays, tcp_relays_test,
             PathNodes, path_nodes_test);
 
 
-/// End of the state format data.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct Eof;
-
-impl ToBytes for Eof {
-    fn to_bytes(&self) -> Vec<u8> {
-        Vec::new()
-    }
-}
-
-#[cfg(test)]
-impl Arbitrary for Eof {
-    fn arbitrary<G: Gen>(_g: &mut G) -> Self { Eof }
-}
-
 /// Data for `Section`. Might, or might not contain valid data.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SectionData {
@@ -1008,6 +1077,7 @@ struct SectionData {
 
 /// Minimal length in bytes of an empty section. Any section that is not empty
 /// should be bigger.
+#[cfg(test)]
 const SECTION_MIN_LEN: usize = 8;
 
 /// According to https://zetok.github.io/tox-spec/#sections
@@ -1021,7 +1091,7 @@ impl SectionData {
     Fails if `SectionData` doesn't contain valid data.
     */
     // TODO: test failures?
-    fn as_section(&self) -> Option<Section> {
+    fn as_section(&self) -> IResult<&[u8], Section> {
         match self.kind {
             SectionKind::NospamKeys => NospamKeys::from_bytes(&self.data)
                 .map(Section::NospamKeys),
@@ -1039,7 +1109,6 @@ impl SectionData {
                 .map(Section::TcpRelays),
             SectionKind::PathNodes => PathNodes::from_bytes(&self.data)
                 .map(Section::PathNodes),
-            SectionKind::EOF => Some(Section::EOF),
         }
     }
 
@@ -1055,38 +1124,77 @@ impl SectionData {
         // TODO: don't return an empty Vec ?
         s.iter()
             .map(|sd| sd.as_section())
-            .filter(|s| s.is_some())
-            .map(|s| s.expect("IS Some(_)"))
+            .filter(|s| s.clone().to_result().is_ok())
+            .map(|s| s.to_result().unwrap())
             .collect()
     }
 }
 
 
-from_bytes!(SectionData, do_parse!(
-    data_len: le_u32 >>
-    kind: call!(SectionKind::parse_bytes) >>
-    tag!(SECTION_MAGIC) >>
-    data: take!(data_len) >>
-    (SectionData { kind, data: data.to_vec() })
-));
+impl FromBytes for SectionData {
+    named!(from_bytes<SectionData>, do_parse!(
+        data_len: le_u32 >>
+        kind: call!(SectionKind::from_bytes) >>
+        tag!(SECTION_MAGIC) >>
+        data: take!(data_len) >>
+        (SectionData { kind, data: data.to_vec() })
+    ));
+}
 
+#[cfg(test)]
+impl Arbitrary for SectionKind {
+    fn arbitrary<G: Gen>(g: &mut G) -> Self {
+        let mut range_val: u8 = 7;
+
+        while range_val > 6 && range_val < 0x0a {
+            range_val = g.gen_range(1, 0x0c);
+        }
+
+        match range_val {
+            1 => SectionKind::NospamKeys,
+            2 => SectionKind::DHT,
+            3 => SectionKind::Friends,
+            4 => SectionKind::Name,
+            5 => SectionKind::StatusMsg,
+            6 => SectionKind::Status,
+            0x0a => SectionKind::TcpRelays,
+            0x0b => SectionKind::PathNodes,
+            _ => {
+                debug!("system error: gen_range() error");
+                SectionKind::NospamKeys
+            },
+        }
+    }
+}
 
 #[cfg(test)]
 impl Arbitrary for SectionData {
     fn arbitrary<G: Gen>(g: &mut G) -> Self {
-        let kind: SectionKind = Arbitrary::arbitrary(g);
-        let data = match kind {
-            SectionKind::NospamKeys => NospamKeys::arbitrary(g).to_bytes(),
-            SectionKind::DHT => DhtState::arbitrary(g).to_bytes(),
-            SectionKind::Friends => Friends::arbitrary(g).to_bytes(),
-            SectionKind::Name => Name::arbitrary(g).0,
-            SectionKind::StatusMsg => StatusMsg::arbitrary(g).0,
-            SectionKind::Status => vec![UserStatus::arbitrary(g) as u8],
-            SectionKind::TcpRelays => TcpRelays::arbitrary(g).to_bytes(),
-            SectionKind::PathNodes => PathNodes::arbitrary(g).to_bytes(),
-            SectionKind::EOF => vec![],
+        let mut range_val: u8 = 7;
+
+        while range_val > 6 && range_val < 0x0a {
+            range_val = g.gen_range(1, 0x0c);
+        }
+
+        let mut buf = [0u8; 2048];
+
+        let data = match range_val {
+            1 => NospamKeys::arbitrary(g).to_bytes((&mut buf, 0)).unwrap().0,
+            2 => DhtState::arbitrary(g).to_bytes((&mut buf, 0)).unwrap().0,
+            3 => Friends::arbitrary(g).to_bytes((&mut buf, 0)).unwrap().0,
+            4 => Name::arbitrary(g).to_bytes((&mut buf, 0)).unwrap().0,
+            5 => StatusMsg::arbitrary(g).to_bytes((&mut buf, 0)).unwrap().0,
+            6 => UserStatus::arbitrary(g).to_bytes((&mut buf, 0)).unwrap().0,
+            0x0a => TcpRelays::arbitrary(g).to_bytes((&mut buf, 0)).unwrap().0,
+            0x0b => PathNodes::arbitrary(g).to_bytes((&mut buf, 0)).unwrap().0,
+            _ => {
+                debug!("system error: gen_range() error");
+                NospamKeys::arbitrary(g).to_bytes((&mut buf, 0)).unwrap().0
+            },
         };
-        SectionData { kind: kind, data: data }
+        let kind = SectionKind::arbitrary(g);
+
+        SectionData { kind, data: data.to_vec() }
     }
 }
 
@@ -1141,8 +1249,6 @@ pub enum Section {
     https://zetok.github.io/tox-spec/#path-nodes-0x0b
     */
     PathNodes(PathNodes),
-    /// End of file. https://zetok.github.io/tox-spec/#eof-0xff
-    EOF,
 }
 
 
@@ -1162,7 +1268,6 @@ pub struct State {
     status: UserStatus,
     tcp_relays: TcpRelays,
     path_nodes: PathNodes,
-    eof: Eof,
 }
 
 /// State Format magic bytes.
@@ -1243,64 +1348,38 @@ impl State {
                     status: state_section!(Section::Status),
                     tcp_relays: state_section!(Section::TcpRelays),
                     path_nodes: state_section!(Section::PathNodes),
-                    eof: Eof,
                 }
             )
     }
 }
 
-from_bytes!(State, do_parse!(
-    tag!(&[0; 4]) >>
-    tag!(STATE_MAGIC) >>
-    sections: map!(many0!(SectionData::parse_bytes), |ref sd| SectionData::into_sect_mult(sd)) >>
-    state: expr_opt!(Self::from_sects(&sections)) >>
-    (state)
-));
+impl FromBytes for State {
+    named!(from_bytes<State>, do_parse!(
+        tag!(&[0; 4]) >>
+        tag!(STATE_MAGIC) >>
+        sections: map!(many0!(SectionData::from_bytes), |ref sd| SectionData::into_sect_mult(sd)) >>
+        state: expr_opt!(Self::from_sects(&sections)) >>
+        (state)
+    ));
+}
 
 impl ToBytes for State {
     // unoptimized
-    fn to_bytes(&self) -> Vec<u8> {
-        // should be run for each State's section
-        fn to_s_bytes<S: ToBytes + SectionKindMatch>(sect: &S) -> Vec<u8> {
-            let bytes = sect.to_bytes();
-            let mut res = Vec::with_capacity(SECTION_MIN_LEN + bytes.len());
-            // length of the section goes first
-            res.write_u32::<LittleEndian>(bytes.len() as u32)
-                .expect("Failed to write State length!");
-            // knowing what's the section is useful
-            res.extend_from_slice(&S::kind().to_bytes());
-            // lets make it *magical*
-            res.extend_from_slice(SECTION_MAGIC);
-            res.extend_from_slice(&bytes);
-            res
-        }
-
-        let mut res = Vec::new();
-        // state header
-        res.extend_from_slice(&[0; 4]);
-        res.extend_from_slice(STATE_MAGIC);
-
-        macro_rules! append_to_res {
-            ($($sect:ident),+) => ($(
-                res.extend_from_slice(&to_s_bytes(&self.$sect));
-            )+)
-        }
-        // Right STR8 C Order:
-        // 1. NospamKeys
-        // 2. Friends
-        // 3. Name
-        // 4. StatusMsg
-        // 5. Status
-        // 6. DhtState ← /obviously/ 2nd section kind fits here
-        // 7. TcpRelays
-        // 8. PathNodes
-        // 9. EOF
-        append_to_res!(nospamkeys, friends, name, status_msg, status,
-                       dhtstate, tcp_relays, path_nodes, eof);
-        res
+    fn to_bytes<'a>(&self, buf: (&'a mut [u8], usize)) -> Result<(&'a mut [u8], usize), GenError> {
+        do_gen!(buf,
+            gen_slice!(&[0; 4]) >>
+            gen_slice!(STATE_MAGIC) >>
+            gen_call!(|buf, nospamkeys| NospamKeys::to_bytes(nospamkeys, buf), &self.nospamkeys) >>
+            gen_call!(|buf, friends| Friends::to_bytes(friends, buf), &self.friends) >>
+            gen_call!(|buf, name| Name::to_bytes(name, buf), &self.name) >>
+            gen_call!(|buf, status_msg| StatusMsg::to_bytes(status_msg, buf), &self.status_msg) >>
+            gen_call!(|buf, status| UserStatus::to_bytes(status, buf), &self.status) >>
+            gen_call!(|buf, dhtstate| DhtState::to_bytes(dhtstate, buf), &self.dhtstate) >>
+            gen_call!(|buf, tcp_relays| TcpRelays::to_bytes(tcp_relays, buf), &self.tcp_relays) >>
+            gen_call!(|buf, path_nodes| PathNodes::to_bytes(path_nodes, buf), &self.path_nodes)
+        )
     }
 }
-
 
 #[cfg(test)]
 impl Arbitrary for State {
@@ -1313,7 +1392,7 @@ impl Arbitrary for State {
             )
         }
         arb_state_section!(nospamkeys, friends, name, status_msg, status,
-                           dhtstate, tcp_relays, path_nodes, eof)
+                           dhtstate, tcp_relays, path_nodes)
     }
 }
 
@@ -1348,59 +1427,64 @@ fn friend_state_new_from_pk_test() {
     quickcheck(with_pkbytes as fn(Vec<u8>) -> TestResult);
 }
 
-// FriendState::parse_bytes()
+// FriendState::from_bytes()
 
 #[test]
-fn friend_state_parse_bytes_test() {
+fn friend_state_from_bytes_test() {
     // serialized and deserialized remain the same
     fn assert_success(bytes: &[u8], friend_state: &FriendState) {
-        let (_, ref p) = FriendState::parse_bytes(bytes).unwrap();
+        let (_, ref p) = FriendState::from_bytes(bytes).unwrap();
         assert_eq!(friend_state, p);
     }
 
     fn with_fs(fs: FriendState) {
-        let fs_bytes = fs.to_bytes();
+        let mut buf = [0u8; 1024];
+        let fs_bytes = fs.to_bytes((&mut buf, 0)).unwrap().0;
         assert_success(&fs_bytes, &fs);
 
         for b in 0..(FRIENDSTATEBYTES - 1) {
-            assert!(FriendState::parse_bytes(&fs_bytes[..b]).is_incomplete());
+            assert!(FriendState::from_bytes(&fs_bytes[..b]).is_incomplete());
         }
 
         { // FriendStatus
-            let mut bytes = fs_bytes.clone();
+            let mut bytes = Vec::new();
+            bytes.clone_from_slice(fs_bytes);
             // TODO: change to inclusive range (`...`) once gets stabilised
             //       rust #28237
             for b in 5..u8::max_value() {
                 bytes[0] = b;
-                assert!(FriendState::parse_bytes(&bytes).is_err());
+                assert!(FriendState::from_bytes(&bytes).is_err());
             }
         }
 
         const FR_MSG_LEN_POS: usize = 1 + PUBLICKEYBYTES + REQUEST_MSG_LEN + 1;
         { // friend request message lenght check
-            let mut bytes = fs_bytes.clone();
+            let mut bytes = Vec::new();
+            bytes.clone_from_slice(fs_bytes);
             for i in (REQUEST_MSG_LEN+1)..2500 { // too slow with bigger ranges
                 BigEndian::write_u16(&mut bytes[FR_MSG_LEN_POS..], i as u16);
-                assert!(FriendState::parse_bytes(&bytes).is_err());
+                assert!(FriendState::from_bytes(&bytes).is_err());
             }
         }
 
         const NAME_LEN_POS: usize = FR_MSG_LEN_POS + NAME_LEN + 2;
         { // friend name lenght check
-            let mut bytes = fs_bytes.clone();
+            let mut bytes = Vec::new();
+            bytes.clone_from_slice(fs_bytes);
             for i in (NAME_LEN+1)..2500 { // too slow with bigger ranges
                 BigEndian::write_u16(&mut bytes[NAME_LEN_POS..], i as u16);
-                assert!(FriendState::parse_bytes(&bytes).is_err());
+                assert!(FriendState::from_bytes(&bytes).is_err());
             }
         }
 
         // padding + bytes containing length
         const STATUS_MSG_LEN_POS: usize = NAME_LEN_POS + STATUS_MSG_LEN + 3;
         { // friend name lenght check
-            let mut bytes = fs_bytes.clone();
+            let mut bytes = Vec::new();
+            bytes.clone_from_slice(fs_bytes);
             for i in (STATUS_MSG_LEN+1)..2500 { // too slow with bigger ranges
                 BigEndian::write_u16(&mut bytes[STATUS_MSG_LEN_POS..], i as u16);
-                assert!(FriendState::parse_bytes(&bytes).is_err());
+                assert!(FriendState::from_bytes(&bytes).is_err());
             }
         }
 
@@ -1408,11 +1492,12 @@ fn friend_state_parse_bytes_test() {
         const USTATUS_POS: usize = STATUS_MSG_LEN_POS + 2;
         { // user status
             fn has_status(bytes: &[u8], status: UserStatus) {
-                let (_, fs) = FriendState::parse_bytes(bytes).unwrap();
+                let (_, fs) = FriendState::from_bytes(bytes).unwrap();
                 assert_eq!(fs.user_status, status);
             }
 
-            let mut bytes = fs_bytes.clone();
+            let mut bytes = Vec::new();
+            bytes.clone_from_slice(fs_bytes);
 
             // TODO: change to inclusive range (`...`) once gets stabilised
             //       rust #28237
@@ -1423,14 +1508,15 @@ fn friend_state_parse_bytes_test() {
                     0 => has_status(&bytes, UserStatus::Online),
                     1 => has_status(&bytes, UserStatus::Away),
                     2 => has_status(&bytes, UserStatus::Busy),
-                    _ => assert!(FriendState::parse_bytes(&bytes).is_err()),
+                    _ => assert!(FriendState::from_bytes(&bytes).is_err()),
                 }
             }
         }
 
         const PADDING_POS: usize = USTATUS_POS + 1;
         { // padding; should be always ignored when parsing
-            let mut bytes = fs_bytes.clone();
+            let mut bytes = Vec::new();
+            bytes.clone_from_slice(fs_bytes);
             // TODO: change to inclusive range (`...`) once gets stabilised
             //       rust #28237
             for i in 0..u8::max_value() {
@@ -1489,7 +1575,7 @@ macro_rules! section_data_with_kind_into {
                 if sd.kind != SectionKind::$kind {
                     return TestResult::discard()
                 }
-                assert!(sd.as_section().is_some());
+                assert!(sd.as_section().to_result().is_ok());
                 TestResult::passed()
             }
             quickcheck(tf as fn(SectionData) -> TestResult);
@@ -1504,14 +1590,13 @@ section_data_with_kind_into!(
     StatusMsg,  section_data_into_sect_test_status_msg,
     Status,     section_data_into_sect_test_status,
     TcpRelays,  section_data_into_sect_test_tcp_relays,
-    PathNodes,  section_data_into_sect_test_path_nodes,
-    EOF,        section_data_into_sect_test_eof
+    PathNodes,  section_data_into_sect_test_path_nodes
 );
 
 #[test]
 fn section_data_into_section_test_random() {
     fn with_section(sd: SectionData) {
-        assert!(sd.as_section().is_some());
+        assert!(sd.as_section().to_result().is_ok());
     }
     quickcheck(with_section as fn(SectionData));
 }
@@ -1524,9 +1609,13 @@ macro_rules! section_data_into_sect_mult_into {
         fn $tname() {
             fn with_sects(s: Vec<$sect>) {
                 let sds: Vec<SectionData> = s.iter()
-                    .map(|se| SectionData {
-                        kind: SectionKind::$kind,
-                        data: se.to_bytes()
+                    .map(|se| {
+                        let mut buf = [0u8; 2048];
+                        SectionData
+                        {
+                            kind: SectionKind::$kind,
+                            data: se.to_bytes((&mut buf, 0)).unwrap().0.to_vec()
+                        }
                     })
                     .collect();
                 let sections = SectionData::into_sect_mult(&sds);
@@ -1564,10 +1653,10 @@ fn section_data_into_sect_mult_test_random() {
     quickcheck(random_sds as fn(Vec<SectionData>));
 }
 
-// SectionData::parse_bytes()
+// SectionData::from_bytes()
 
 #[test]
-fn section_data_parse_bytes_test() {
+fn section_data_from_bytes_test() {
     fn rand_b_sect(kind: SectionKind, bytes: &[u8]) -> Vec<u8> {
         let mut b_sect = Vec::with_capacity(bytes.len() + SECTION_MIN_LEN);
         b_sect.write_u32::<LittleEndian>(bytes.len() as u32).unwrap();
@@ -1581,7 +1670,7 @@ fn section_data_parse_bytes_test() {
         let b_sect = rand_b_sect(kind, &bytes);
 
         { // working case
-            let (left, section) = SectionData::parse_bytes(&b_sect).unwrap();
+            let (left, section) = SectionData::from_bytes(&b_sect).unwrap();
 
             assert_eq!(0, left.len());
             assert_eq!(section.kind, kind);
@@ -1590,7 +1679,7 @@ fn section_data_parse_bytes_test() {
 
         { // wrong SectionKind
             fn wrong_skind(bytes: &[u8]) {
-                assert!(SectionData::parse_bytes(bytes).is_err());
+                assert!(SectionData::from_bytes(bytes).is_err());
             }
 
             let mut b_sect = b_sect.clone();
@@ -1612,12 +1701,12 @@ fn section_data_parse_bytes_test() {
 
         // too short
         for l in 0..SECTION_MIN_LEN {
-            assert!(SectionData::parse_bytes(&b_sect[..l]).is_incomplete());
+            assert!(SectionData::from_bytes(&b_sect[..l]).is_incomplete());
         }
 
         // wrong len
         for l in SECTION_MIN_LEN..(b_sect.len() - 1) {
-            assert!(SectionData::parse_bytes(&b_sect[..l]).is_incomplete());
+            assert!(SectionData::from_bytes(&b_sect[..l]).is_incomplete());
         }
     }
     quickcheck(with_bytes as fn(Vec<u8>, SectionKind));
@@ -1634,7 +1723,7 @@ fn section_data_parse_bytes_test() {
         b_sect.extend_from_slice(&tmp_b_sect[..SECTION_MIN_LEN - 2]);
         b_sect.extend_from_slice(&magic[..2]);
         b_sect.extend_from_slice(&tmp_b_sect[SECTION_MIN_LEN..]);
-        assert!(SectionData::parse_bytes(&b_sect).is_err());
+        assert!(SectionData::from_bytes(&b_sect).is_err());
         TestResult::passed()
     }
     quickcheck(with_magic as fn(Vec<u8>, SectionKind, Vec<u8>) -> TestResult);
@@ -1680,39 +1769,41 @@ fn state_is_own_pk_test() {
     quickcheck(with_pk as fn(State, Vec<u8>) -> TestResult);
 }
 
-// State::parse_bytes()
+// State::from_bytes()
 
 #[test]
-fn state_parse_bytes_test_magic() {
+fn state_from_bytes_test_magic() {
     fn with_state(state: State, rand_bytes: Vec<u8>) -> TestResult {
         if rand_bytes.len() < STATE_HEAD_LEN {
             return TestResult::discard()
         }
 
-        let state_bytes = state.to_bytes();
-        assert!(State::parse_bytes(&state_bytes).is_done());
+        let mut buf = [0u8; 1024];
+        let state_bytes = state.to_bytes((&mut buf, 0)).unwrap().0;
+        assert!(State::from_bytes(&state_bytes).is_done());
 
         let mut invalid_bytes = Vec::with_capacity(state_bytes.len());
         invalid_bytes.extend_from_slice(&rand_bytes[..STATE_HEAD_LEN]);
         invalid_bytes.extend_from_slice(&state_bytes[STATE_HEAD_LEN..]);
-        assert!(State::parse_bytes(&invalid_bytes).is_err());
+        assert!(State::from_bytes(&invalid_bytes).is_err());
         TestResult::passed()
     }
     quickcheck(with_state as fn(State, Vec<u8>) -> TestResult);
 }
 
 #[test]
-fn state_parse_bytes_test_section_detect() {
+fn state_from_bytes_test_section_detect() {
     fn with_state(state: State, rand_byte: u8) -> TestResult {
         if rand_byte == SECTION_MAGIC[0] {
             return TestResult::discard()
         }
 
-        let bytes: Vec<u8> = state.to_bytes().iter_mut()
+        let mut buf = [0u8; 1024];
+        let bytes: Vec<u8> = state.to_bytes((&mut buf, 0)).unwrap().0.iter_mut()
             .map(|b| { if *b == SECTION_MAGIC[0] { *b = rand_byte; } *b })
             .collect();
 
-        assert!(State::parse_bytes(&bytes).is_err());
+        assert!(State::from_bytes(&bytes).is_err());
 
         TestResult::passed()
     }
