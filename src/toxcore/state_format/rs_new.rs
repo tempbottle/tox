@@ -22,10 +22,8 @@
 
 use std::default::Default;
 #[cfg(test)]
-use byteorder::{BigEndian, LittleEndian, WriteBytesExt};
-#[cfg(test)]
-use byteorder::ByteOrder;
-use nom::{be_u16, le_u16, le_u8, le_u32, le_u64, rest};
+use byteorder::{LittleEndian, WriteBytesExt};
+use nom::{be_u16, be_u32, le_u16, le_u8, le_u32, le_u64, rest};
 
 use toxcore::binary_io::*;
 use toxcore::crypto_core::*;
@@ -137,7 +135,7 @@ assert_eq!(vec![11u8, 0],  SectionKind::PathNodes  .to_bytes());
 impl ToBytes for SectionKind {
     fn to_bytes<'a>(&self, buf: (&'a mut [u8], usize)) -> Result<(&'a mut [u8], usize), GenError> {
         do_gen!(buf,
-            gen_le_u16!(0x00 << 8 | *self as u8)
+            gen_le_u16!(*self as u16)
         )
     }
 }
@@ -382,10 +380,10 @@ assert_eq!(DhtState(vec![]), DhtState::from_bytes(&serialized).unwrap());
 impl FromBytes for DhtState {
     named!(from_bytes<DhtState>, do_parse!(
         verify!(le_u32, |value| value == DHT_MAGICAL) >> // check whether beginning of the section matches DHT magic bytes
-        nodes: le_u32 >>
+        nodes: be_u32 >>
         verify!(le_u16, |value| value == DHT_SECTION_TYPE) >> // check DHT section type
         verify!(le_u16, |value| value == DHT_2ND_MAGICAL) >> // check whether yet another magic number matches
-        pns: flat_map!(take!(nodes as usize), many0!(PackedNode::from_bytes)) >>
+        pns: many0!(PackedNode::from_bytes) >>
         (DhtState(pns))
     ));
 }
@@ -412,7 +410,7 @@ impl ToBytes for DhtState {
     fn to_bytes<'a>(&self, buf: (&'a mut [u8], usize)) -> Result<(&'a mut [u8], usize), GenError> {
         do_gen!(buf,
             gen_le_u32!(DHT_MAGICAL as u32) >>
-            gen_le_u32!(self.0.len() as u32) >>
+            gen_be_u32!(self.0.len() as u32) >>
             gen_le_u16!(DHT_SECTION_TYPE as u16) >>
             gen_le_u16!(DHT_2ND_MAGICAL as u16) >>
             gen_many_ref!(&self.0, |buf, node| PackedNode::to_bytes(node, buf))
@@ -610,32 +608,32 @@ impl FriendState {
 
 
 /// Number of bytes of serialized [`FriendState`](./struct.FriendState.html).
-pub const FRIENDSTATEBYTES: usize = 1      // "Status"
-                                  + PUBLICKEYBYTES
-/* actual size of FR message   */ + 2
-/* Friend request message      */ + REQUEST_MSG_LEN
-/* actual size of Name         */ + 2
-/* Name                        */ + NAME_LEN
-/* actual size of status msg   */ + 2
-/* Status msg                  */ + STATUS_MSG_LEN
-/* UserStatus                  */ + 1
-/* only used for sending FR    */ + NOSPAMBYTES
-/* last time seen              */ + 8;
+//pub const FRIENDSTATEBYTES: usize = 1      // "Status"
+//                                  + PUBLICKEYBYTES
+///* actual size of FR message   */ + 2
+///* Friend request message      */ + REQUEST_MSG_LEN
+///* actual size of Name         */ + 2
+///* Name                        */ + NAME_LEN
+///* actual size of status msg   */ + 2
+///* Status msg                  */ + STATUS_MSG_LEN
+///* UserStatus                  */ + 1
+///* only used for sending FR    */ + NOSPAMBYTES
+///* last time seen              */ + 8;
 
 impl FromBytes for FriendState {
     named!(from_bytes<FriendState>, do_parse!(
         status: call!(FriendStatus::from_bytes) >>
         pk: call!(PublicKey::from_bytes) >>
         fr_msg_len: be_u16 >>
-//        verify!(fr_msg_len, |len| len <= REQUEST_MSG_LEN) >>
+        verify!(value!(fr_msg_len), |len| len <= REQUEST_MSG_LEN as u16) >>
         fr_msg_bytes: take!(fr_msg_len) >>
         fr_msg: value!(fr_msg_bytes[..fr_msg_len as usize].to_vec()) >>
         name_len: be_u16 >>
-//        verify!(name_len, |len| len <= NAME_LEN) >>
+        verify!(value!(name_len), |len| len <= NAME_LEN as u16) >>
         name_bytes: take!(name_len) >>
         name: value!(Name(name_bytes[..name_len as usize].to_vec())) >>
         status_msg_len: be_u16 >>
-//        verify!(status_msg_len, |len| len <= STATUS_MSG_LEN) >>
+        verify!(value!(status_msg_len), |len| len <= STATUS_MSG_LEN as u16) >>
         status_msg_bytes: take!(status_msg_len) >>
         status_msg: value!(StatusMsg(status_msg_bytes[..status_msg_len as usize].to_vec())) >>
         user_status: call!(UserStatus::from_bytes) >>
@@ -728,7 +726,7 @@ impl Arbitrary for StatusMsg {
 #[cfg(test)]
 impl Arbitrary for DhtState {
     fn arbitrary<G: Gen>(g: &mut G) -> Self {
-        let node_num = g.gen_range(0, 65);
+        let node_num = g.gen_range(0, 5);
         let nodes = (0..node_num).into_iter()
             .map(|_| PackedNode::arbitrary(g))
             .collect::<Vec<PackedNode>>();
@@ -877,8 +875,9 @@ macro_rules! impl_to_bytes_for_bytes_struct {
         #[test]
         fn $tname() {
             fn test_fn(s: $name) {
-                let mut buf = [0; 512];
-                assert_eq!(s.0, s.to_bytes((&mut buf, 0)).unwrap().0);
+                let mut buf = [0; 1024];
+                let (_, size) = s.to_bytes((&mut buf, 0)).unwrap();
+                assert_eq!(s.0, buf[..size].to_vec());
             }
             quickcheck(test_fn as fn($name));
         }
@@ -1043,9 +1042,10 @@ macro_rules! nodes_list {
         fn $tname() {
             fn with_pns(pns: Vec<PackedNode>) {
                 let mut bytes = Vec::new();
-                let mut buf = [0u8; 1024];
+                let mut buf = [0u8; 1024 * 10];
                 for pn in &pns {
-                    bytes.append(&mut pn.to_bytes((&mut buf, 0)).unwrap().0.to_vec());
+                    let (_, size) = pn.to_bytes((&mut buf, 0)).unwrap();
+                    bytes.append(&mut buf[..size].to_vec());
                 }
                 {
                     let (r_bytes, p) = $name::from_bytes(&bytes).unwrap();
@@ -1054,7 +1054,8 @@ macro_rules! nodes_list {
                     assert_eq!(&[] as &[u8], r_bytes);
                 }
 
-                assert_eq!($name(pns).to_bytes((&mut buf, 0)).unwrap().0.to_vec(), bytes);
+                let (_, size) = $name(pns).to_bytes((&mut buf, 0)).unwrap();
+                assert_eq!(buf[..size].to_vec(), bytes);
             }
             quickcheck(with_pns as fn(Vec<PackedNode>));
 
@@ -1124,7 +1125,7 @@ impl SectionData {
         // TODO: don't return an empty Vec ?
         s.iter()
             .map(|sd| sd.as_section())
-            .filter(|s| s.clone().to_result().is_ok())
+            .filter(|s| s.clone().is_done())
             .map(|s| s.to_result().unwrap())
             .collect()
     }
@@ -1176,23 +1177,56 @@ impl Arbitrary for SectionData {
             range_val = g.gen_range(1, 0x0c);
         }
 
-        let mut buf = [0u8; 2048];
+        let mut buf = [0u8; 1024 * 1024];
+        let mut kind = SectionKind::NospamKeys;
 
         let data = match range_val {
-            1 => NospamKeys::arbitrary(g).to_bytes((&mut buf, 0)).unwrap().0,
-            2 => DhtState::arbitrary(g).to_bytes((&mut buf, 0)).unwrap().0,
-            3 => Friends::arbitrary(g).to_bytes((&mut buf, 0)).unwrap().0,
-            4 => Name::arbitrary(g).to_bytes((&mut buf, 0)).unwrap().0,
-            5 => StatusMsg::arbitrary(g).to_bytes((&mut buf, 0)).unwrap().0,
-            6 => UserStatus::arbitrary(g).to_bytes((&mut buf, 0)).unwrap().0,
-            0x0a => TcpRelays::arbitrary(g).to_bytes((&mut buf, 0)).unwrap().0,
-            0x0b => PathNodes::arbitrary(g).to_bytes((&mut buf, 0)).unwrap().0,
+            1 => {
+                kind = SectionKind::NospamKeys;
+                let (_, size) = NospamKeys::arbitrary(g).to_bytes((&mut buf, 0)).unwrap();
+                &buf[..size]
+            },
+            2 => {
+                kind = SectionKind::DHT;
+                let (_, size) = DhtState::arbitrary(g).to_bytes((&mut buf, 0)).unwrap();
+                &buf[..size]
+            },
+            3 => {
+                kind = SectionKind::Friends;
+                let (_, size) = Friends::arbitrary(g).to_bytes((&mut buf, 0)).unwrap();
+                &buf[..size]
+            },
+            4 => {
+                kind = SectionKind::Name;
+                let (_, size) = Name::arbitrary(g).to_bytes((&mut buf, 0)).unwrap();
+                &buf[..size]
+            },
+            5 => {
+                kind = SectionKind::StatusMsg;
+                let (_, size) = StatusMsg::arbitrary(g).to_bytes((&mut buf, 0)).unwrap();
+                &buf[..size]
+            },
+            6 => {
+                kind = SectionKind::Status;
+                let (_, size) = UserStatus::arbitrary(g).to_bytes((&mut buf, 0)).unwrap();
+                &buf[..size]
+            },
+            0x0a => {
+                kind = SectionKind::TcpRelays;
+                let (_, size) = TcpRelays::arbitrary(g).to_bytes((&mut buf, 0)).unwrap();
+                &buf[..size]
+            },
+            0x0b => {
+                kind = SectionKind::PathNodes;
+                let (_, size) = PathNodes::arbitrary(g).to_bytes((&mut buf, 0)).unwrap();
+                &buf[..size]
+            },
             _ => {
                 debug!("system error: gen_range() error");
-                NospamKeys::arbitrary(g).to_bytes((&mut buf, 0)).unwrap().0
+                let (_, size) = NospamKeys::arbitrary(g).to_bytes((&mut buf, 0)).unwrap();
+                &buf[..size]
             },
-        };
-        let kind = SectionKind::arbitrary(g);
+        };;
 
         SectionData { kind, data: data.to_vec() }
     }
@@ -1438,100 +1472,14 @@ fn friend_state_from_bytes_test() {
     }
 
     fn with_fs(fs: FriendState) {
-        let mut buf = [0u8; 1024];
-        let fs_bytes = fs.to_bytes((&mut buf, 0)).unwrap().0;
+        let mut buf = [0u8; 4096];
+        let (_, size) = fs.to_bytes((&mut buf, 0)).unwrap();
+        let fs_bytes = &buf[..size];
         assert_success(&fs_bytes, &fs);
 
-        for b in 0..(FRIENDSTATEBYTES - 1) {
+        for b in 0..(fs_bytes.len() - 1) {
             assert!(FriendState::from_bytes(&fs_bytes[..b]).is_incomplete());
         }
-
-        { // FriendStatus
-            let mut bytes = Vec::new();
-            bytes.clone_from_slice(fs_bytes);
-            // TODO: change to inclusive range (`...`) once gets stabilised
-            //       rust #28237
-            for b in 5..u8::max_value() {
-                bytes[0] = b;
-                assert!(FriendState::from_bytes(&bytes).is_err());
-            }
-        }
-
-        const FR_MSG_LEN_POS: usize = 1 + PUBLICKEYBYTES + REQUEST_MSG_LEN + 1;
-        { // friend request message lenght check
-            let mut bytes = Vec::new();
-            bytes.clone_from_slice(fs_bytes);
-            for i in (REQUEST_MSG_LEN+1)..2500 { // too slow with bigger ranges
-                BigEndian::write_u16(&mut bytes[FR_MSG_LEN_POS..], i as u16);
-                assert!(FriendState::from_bytes(&bytes).is_err());
-            }
-        }
-
-        const NAME_LEN_POS: usize = FR_MSG_LEN_POS + NAME_LEN + 2;
-        { // friend name lenght check
-            let mut bytes = Vec::new();
-            bytes.clone_from_slice(fs_bytes);
-            for i in (NAME_LEN+1)..2500 { // too slow with bigger ranges
-                BigEndian::write_u16(&mut bytes[NAME_LEN_POS..], i as u16);
-                assert!(FriendState::from_bytes(&bytes).is_err());
-            }
-        }
-
-        // padding + bytes containing length
-        const STATUS_MSG_LEN_POS: usize = NAME_LEN_POS + STATUS_MSG_LEN + 3;
-        { // friend name lenght check
-            let mut bytes = Vec::new();
-            bytes.clone_from_slice(fs_bytes);
-            for i in (STATUS_MSG_LEN+1)..2500 { // too slow with bigger ranges
-                BigEndian::write_u16(&mut bytes[STATUS_MSG_LEN_POS..], i as u16);
-                assert!(FriendState::from_bytes(&bytes).is_err());
-            }
-        }
-
-
-        const USTATUS_POS: usize = STATUS_MSG_LEN_POS + 2;
-        { // user status
-            fn has_status(bytes: &[u8], status: UserStatus) {
-                let (_, fs) = FriendState::from_bytes(bytes).unwrap();
-                assert_eq!(fs.user_status, status);
-            }
-
-            let mut bytes = Vec::new();
-            bytes.clone_from_slice(fs_bytes);
-
-            // TODO: change to inclusive range (`...`) once gets stabilised
-            //       rust #28237
-            for i in 0..u8::max_value() {
-                bytes[USTATUS_POS] = i;
-
-                match i {
-                    0 => has_status(&bytes, UserStatus::Online),
-                    1 => has_status(&bytes, UserStatus::Away),
-                    2 => has_status(&bytes, UserStatus::Busy),
-                    _ => assert!(FriendState::from_bytes(&bytes).is_err()),
-                }
-            }
-        }
-
-        const PADDING_POS: usize = USTATUS_POS + 1;
-        { // padding; should be always ignored when parsing
-            let mut bytes = Vec::new();
-            bytes.clone_from_slice(fs_bytes);
-            // TODO: change to inclusive range (`...`) once gets stabilised
-            //       rust #28237
-            for i in 0..u8::max_value() {
-                bytes[PADDING_POS]   = i;
-                bytes[PADDING_POS+1] = i;
-                bytes[PADDING_POS+2] = i;
-                assert_success(&bytes, &fs);
-            }
-        }
-
-        // TODO: test for:
-        //
-        // nospam
-        //
-        // last time seen
     }
     quickcheck(with_fs as fn(FriendState));
 }
@@ -1575,7 +1523,8 @@ macro_rules! section_data_with_kind_into {
                 if sd.kind != SectionKind::$kind {
                     return TestResult::discard()
                 }
-                assert!(sd.as_section().to_result().is_ok());
+                let result = sd.as_section();
+                assert!(result.is_done());
                 TestResult::passed()
             }
             quickcheck(tf as fn(SectionData) -> TestResult);
@@ -1608,24 +1557,27 @@ macro_rules! section_data_into_sect_mult_into {
         #[test]
         fn $tname() {
             fn with_sects(s: Vec<$sect>) {
+                if s.len() == 0 {
+                    return
+                }
+
                 let sds: Vec<SectionData> = s.iter()
                     .map(|se| {
-                        let mut buf = [0u8; 2048];
+                        let mut buf = [0u8; 1024 * 1024];
+                        let (_, size) = se.to_bytes((&mut buf, 0)).unwrap();
                         SectionData
                         {
                             kind: SectionKind::$kind,
-                            data: se.to_bytes((&mut buf, 0)).unwrap().0.to_vec()
+                            data: buf[..size].to_vec()
                         }
                     })
                     .collect();
                 let sections = SectionData::into_sect_mult(&sds);
-                assert_eq!(s.len(), sections.len());
-                if !s.is_empty() {
-                    assert!(sections.iter().all(|se| match *se {
-                        Section::$kind(_) => true,
-                        _ => false,
-                    }));
-                }
+
+                assert!(sections.iter().all(|se| match *se {
+                    Section::$kind(_) => true,
+                    _ => false,
+                }));
             }
             QuickCheck::new().max_tests(20).quickcheck(with_sects as fn(Vec<$sect>));
         }
@@ -1774,12 +1726,13 @@ fn state_is_own_pk_test() {
 #[test]
 fn state_from_bytes_test_magic() {
     fn with_state(state: State, rand_bytes: Vec<u8>) -> TestResult {
-        if rand_bytes.len() < STATE_HEAD_LEN {
+        if rand_bytes.len() < STATE_HEAD_LEN || rand_bytes.len() >= 1024 {
             return TestResult::discard()
         }
 
-        let mut buf = [0u8; 1024];
-        let state_bytes = state.to_bytes((&mut buf, 0)).unwrap().0;
+        let mut buf = [0u8; 1024 * 1024];
+        let (_, size) = state.to_bytes((&mut buf, 0)).unwrap();
+        let state_bytes = &buf[..size];
         assert!(State::from_bytes(&state_bytes).is_done());
 
         let mut invalid_bytes = Vec::with_capacity(state_bytes.len());
@@ -1798,8 +1751,9 @@ fn state_from_bytes_test_section_detect() {
             return TestResult::discard()
         }
 
-        let mut buf = [0u8; 1024];
-        let bytes: Vec<u8> = state.to_bytes((&mut buf, 0)).unwrap().0.iter_mut()
+        let mut buf = [0u8; 1024 * 1024];
+        let (_, size) = state.to_bytes((&mut buf, 0)).unwrap();
+        let bytes: Vec<u8> = buf[..size].iter_mut()
             .map(|b| { if *b == SECTION_MAGIC[0] { *b = rand_byte; } *b })
             .collect();
 
