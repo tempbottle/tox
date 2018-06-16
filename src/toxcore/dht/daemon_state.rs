@@ -28,7 +28,7 @@ Toxcore daemon saves its states to file every 10 minutes.
 use toxcore::dht::server::*;
 use toxcore::dht::packed_node::*;
 use toxcore::dht::server::client::*;
-use toxcore::state_format::rs_new::*;
+use toxcore::state_format::new::*;
 use toxcore::binary_io::*;
 
 /// Save or load states of toxcore daemon
